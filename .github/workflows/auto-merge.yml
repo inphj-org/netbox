@@ -3,11 +3,15 @@ name: 자동 머지
 # PR 검증이 끝나면 그 커밋의 체크가 **전부** 초록인지 보고 머지한다 — 사람 PR 도 포함(사용자 결정 2026-09-13).
 # Free org 라 GitHub 보호 규칙이 없어 이 워크플로가 그 역할이다. 그만큼 PR 체크를 믿어야 한다.
 #
-# 함정 둘:
+# 함정 셋:
 #   - GITHUB_TOKEN 이 한 머지는 push 이벤트를 안 만들어 deploy.yml 이 안 돈다. 그래서 머지 뒤
 #     deploy.yml 을 workflow_dispatch 로 직접 부른다(그건 GITHUB_TOKEN 으로도 허용된다).
 #   - workflow_run 워크플로는 **main 에 있는 판**이 돈다. PR 에서 이 파일을 고쳐도 머지 전엔 안 바뀐다.
 #     처음 넣는 PR 은 사람이 머지해야 한다.
+#   - **대기 중인 run 은 새 run 이 오면 취소된다**(같은 concurrency 그룹, cancel-in-progress: false 는
+#     진행 중인 것만 지킨다). 전에는 잡이 `run.pull_requests`(자기를 부른 PR)만 봐서, 취소된 run 의 PR 을
+#     **아무도 안 집었다** — 체크가 초록인데 조용히 안 머지된 채 남는다(9f 보고, 2026-09-13 3회 관측).
+#     그래서 **열린 PR 을 전부 훑는다.** 어느 run 이든 준비된 PR 을 회수하므로 취소가 나도 자기치유된다.
 
 on:
   workflow_run:
@@ -36,44 +40,55 @@ jobs:
       - uses: actions/github-script@v7
         with:
           script: |
-            const run = context.payload.workflow_run;
-            const sha = run.head_sha;
             const { owner, repo } = context.repo;
             const ME = '머지';
-            // 1. 이 커밋의 PR. 포크에서 온 PR 은 pull_requests 가 비어 여기서 걸러진다.
-            const prs = run.pull_requests || [];
-            if (!prs.length) { core.info('PR 없음(포크이거나 이미 닫힘) - 아무것도 안 함'); return; }
-            for (const p of prs) {
+            const SELF = `${owner}/${repo}`;
+            // 1. 열린 PR 을 전부 본다. 이 run 을 부른 PR 만 보면, 취소된 run 의 PR 이 영영 안 머지된다.
+            const { data: open } = await github.rest.pulls.list({
+              owner, repo, state: 'open', base: 'main', per_page: 100 });
+            core.info(`열린 PR ${open.length}건 검사`);
+            let merged = 0;
+            for (const p of open) {
               const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: p.number });
-              if (pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== sha) {
-                core.info(`#${pr.number} 건너뜀: state=${pr.state} draft=${pr.draft} base=${pr.base.ref} head일치=${pr.head.sha === sha}`);
+              // 2. 포크 PR 은 머지하지 않는다. 전에는 run.pull_requests 가 비어 우연히 걸러졌는데,
+              //    열린 PR 을 훑으면 포크도 목록에 들어오므로 **여기서 명시적으로** 막아야 한다.
+              const from = pr.head.repo ? pr.head.repo.full_name : null;
+              if (from !== SELF) { core.info(`#${pr.number} 건너뜀: 포크/삭제된 원본 (${from})`); continue; }
+              if (pr.draft || pr.base.ref !== 'main') {
+                core.info(`#${pr.number} 건너뜀: draft=${pr.draft} base=${pr.base.ref}`);
                 continue;
               }
-              // 2. 그 커밋의 체크 전부 - 이 잡 자신은 뺀다. 하나라도 미완·실패면 안 한다.
+              const sha = pr.head.sha;
+              // 3. 그 커밋의 체크 전부 - 이 잡 자신은 뺀다. 하나라도 미완·실패면 안 한다.
+              //    아직 도는 중인 PR 은 흔하므로 실패로 처리하지 않고 넘어간다(다음 run 이 다시 본다).
               const { data: cr } = await github.rest.checks.listForRef({ owner, repo, ref: sha, per_page: 100 });
               const others = cr.check_runs.filter(c => c.name !== ME);
               const bad = others.filter(c => c.status !== 'completed' || !['success', 'neutral', 'skipped'].includes(c.conclusion));
               const verified = others.some(c => c.name === '포크 규칙' && c.conclusion === 'success');
               if (!verified || bad.length) {
-                core.setFailed(`#${pr.number} 머지 안 함: 검증통과=${verified} 미완·실패=${bad.map(c => c.name + ':' + (c.conclusion || c.status)).join(',') || '없음'}`);
+                core.info(`#${pr.number} 아직: 검증통과=${verified} 미완·실패=${bad.map(c => c.name + ':' + (c.conclusion || c.status)).join(',') || '없음'}`);
                 continue;
               }
-              // 3. 머지. mergeable 은 GitHub 이 뒤늦게 계산하므로 잠깐 기다린다.
+              // 4. 머지. mergeable 은 GitHub 이 뒤늦게 계산하므로 잠깐 기다린다.
               let m = pr;
               for (let i = 0; i < 5 && m.mergeable === null; i++) {
                 await new Promise(r => setTimeout(r, 3000));
                 m = (await github.rest.pulls.get({ owner, repo, pull_number: pr.number })).data;
               }
-              if (m.mergeable === false) { core.setFailed(`#${pr.number} 충돌 - 머지 안 함`); continue; }
+              if (m.mergeable === false) { core.warning(`#${pr.number} 충돌 - 머지 안 함`); continue; }
               const res = await github.rest.pulls.merge({ owner, repo, pull_number: pr.number, merge_method: 'merge', sha });
               core.info(`#${pr.number} 머지 → ${res.data.sha}`);
+              merged++;
               try { await github.rest.git.deleteRef({ owner, repo, ref: `heads/${pr.head.ref}` }); }
               catch (e) { core.info('브랜치 삭제 실패(무시): ' + e.message); }
-              // 4. 배포 호출 - GITHUB_TOKEN 머지는 push 이벤트를 안 낸다. deploy.yml 이 없는 저장소는 건너뛴다.
-              try {
-                await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: 'deploy.yml', ref: 'main' });
-                core.info('deploy.yml 호출(main)');
-              } catch (e) {
-                if (e.status === 404) core.info('deploy.yml 없음 - 배포 호출 생략'); else throw e;
-              }
+            }
+            // 5. 배포 호출 - GITHUB_TOKEN 머지는 push 이벤트를 안 낸다. 여러 건을 머지했어도 한 번만 부른다
+            //    (deploy.py plan 이 ci-deployed 태그를 기준으로 보므로 한 번이면 전부 덮는다).
+            //    deploy.yml 이 없는 저장소는 건너뛴다.
+            if (!merged) { core.info('머지한 것 없음 - 배포 호출 생략'); return; }
+            try {
+              await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: 'deploy.yml', ref: 'main' });
+              core.info(`${merged}건 머지, deploy.yml 호출(main)`);
+            } catch (e) {
+              if (e.status === 404) core.info('deploy.yml 없음 - 배포 호출 생략'); else throw e;
             }
