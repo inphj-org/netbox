@@ -18,7 +18,10 @@ name: 자동 머지
 
 on:
   workflow_run:
-    workflows: ["포크 검증"]
+    # 포크는 체크를 남기는 워크플로가 셋이다. 그 중 마지막에 끝난 것이 부르지 않으면 초록 PR 이 다음 PR 까지 멈춘다
+    # (2026-09-14 #4: 포크 검증이 끝났을 때 CodeQL 이 도는 중이라 "아직" 으로 넘기고, CodeQL 이 끝나도 아무도 다시 안 불렀다).
+    # 스크립트는 열린 PR 을 전부 훑고 미완 체크가 있으면 넘기므로 여러 번 돌아도 해가 없다.
+    workflows: ["포크 검증", "CI", "CodeQL"]
     types: [completed]
 
 concurrency:
